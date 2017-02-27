@@ -372,23 +372,144 @@ function lower(s::FileUnpacker,collection)
     end
 end
 
-function adjust_env(env)
+function adjust_env(env, extra_env...)
     ret = similar(env)
-    merge!(ret,ENV)
-    merge!(ret,env) #s.env overrides ENV
+    merge!(ret, ENV)
+    merge!(ret, env) #s.env overrides ENV
+    map(e -> merge!(ret, e), extra_env)
     ret
+end
+
+if KERNEL == :FreeBSD
+    function makefile(cwd; uses::Array=[])
+        uses_str = join(uses, ' ')
+        join([
+            "CATEGORIES= devel",
+            (isempty(cwd) ? "" : "WRKDIR= $cwd"),
+            "USES= $uses_str",
+            ".include <bsd.port.mk>"
+        ], '\n') * "\0" # append "\0" to deal with a bug in bmake
+    end
+
+    """
+        parse_env(str::String)::Dict
+
+    Simple parser for make variables.
+
+    ```jldoctest
+    julia> parse_env("ANSWER=\"42\"")
+    Dict{String,String} with 1 entry:
+      "ANSWER" => "42"
+
+    julia> parse_env("ANSWER=\"42\" EMPTY=\"\" FOO=\"bar\"")
+    Dict{String,String} with 3 entries:
+      "FOO"    => "bar"
+      "ANSWER" => "42"
+      "EMPTY"  => ""
+
+    ```
+    """
+    function parse_env(str::String)::Dict
+        stack = Array{Char}(0)
+        buf = Array{Char}(0)
+        tokens = Array{String}(0)
+
+        for c ∈ str
+            if c ∈ ('"', '\'')
+                if !isempty(stack) && stack[end] == c
+                    pop!(stack)
+                    if isempty(stack)
+                        push!(tokens, String(buf))
+                        empty!(buf)
+                    end
+                else
+                    push!(stack, c)
+                end
+                continue
+            elseif c ∈ (' ', '=', '\n')
+                if isempty(stack) && !isempty(buf)
+                    push!(tokens, String(buf))
+                    empty!(buf)
+                    continue
+                elseif !isempty(stack)
+                    nothing
+                else
+                    continue
+                end
+            end
+
+            push!(buf, c)
+        end
+
+        @assert length(tokens) % 2 == 0
+        Dict(zip(tokens[1:2:end], tokens[2:2:end]))
+    end
+
+    """
+        make_var(cwd=""; uses=[])
+
+    Extract the make variable value from ``make -V``.
+    We will include the FreeBSD port framework
+    via following Makefile by default:
+
+    ```
+    CATEGORIES= devel
+    WRKDIR= [cwd]  # if cwd exists
+    USES= [uses...]
+    .include <bsd.port.mk>
+    ```
+    """
+    function make_var(var::String, cwd::String=""; uses::Array=[])
+        cmd = `/usr/bin/make -f - -V $var`
+        in_ = Pipe()
+        out, proc = open(cmd, "r", in_)
+
+        print(in_, makefile(cwd; :uses=>uses))
+        close(in_)
+
+        raw = try
+            success(proc)
+            readstring(out)
+        catch
+            return ""
+        finally
+            close(out)
+        end
+
+        d = parse_env(raw)
+
+        if length(d) <= 1
+            chomp(raw)
+        else
+            d
+        end
+    end
+
+    function make_env(cwd::String=""; uses::Array=[])
+        make_var("MAKE_ENV", cwd; :uses=>uses)
+    end
 end
 
 if is_unix()
     function lower(a::MakeTargets,collection)
         cmd = `make -j8`
+        extra_env = Dict()
+
+        if KERNEL == :FreeBSD
+            jobs = make_var("MAKE_JOBS_NUMBER")
+            # tons of project written their Makefile in GNU Make only syntax,
+            # but the implementation of `make` on FreeBSD system base is `bmake`
+            cmd = `gmake -j$jobs`
+            extra_env = make_env(a.dir; :uses=>["gmake"])
+        end
+
         if !isempty(a.dir)
             cmd = `$cmd -C $(a.dir)`
         end
         if !isempty(a.targets)
             cmd = `$cmd $(a.targets)`
         end
-        @dependent_steps ( setenv(cmd, adjust_env(a.env)), )
+        @dependent_steps ( setenv(cmd, adjust_env(a.env, extra_env)), )
     end
 end
 is_windows() && (lower(a::MakeTargets,collection) = @dependent_steps ( setenv(`make $(!isempty(a.dir)?"-C "*a.dir:"") $(a.targets)`, adjust_env(a.env)), ))
@@ -507,9 +628,6 @@ function run(s::SynchronousStepCollection)
 		end
     end
 end
-
-is_unix() && (make_command = `make -j8`)
-is_windows() && (make_command = `make`)
 
 function prepare_src(depsdir,url, downloaded_file, directory_name)
     local_file = joinpath(joinpath(depsdir,"downloads"),downloaded_file)
